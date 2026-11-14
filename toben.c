@@ -1,124 +1,79 @@
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <ncurses.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
-#include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <stdint.h>
+#include <limits.h>
 
-#define MAX_LINES 10000
-#define MAX_LINE 4096
-#define VERSION "0.4"
+#define VERSION "0.6"
+#define HISTORY_LIMIT 32
+#define HISTORY_MEMORY (8 * 1024 * 1024)
 
 typedef enum {
     LANG_PYTHON,
     LANG_C,
     LANG_CPP,
-    LANG_BASH
+    LANG_BASH,
+    LANG_RUST
 } Language;
 
-char *lines[MAX_LINES];
+typedef struct {
+    char **lines;
+    size_t count;
+    int cy, cx;
+    int dirty;
+    size_t bytes;
+} Snapshot;
 
-int line_count = 1;
+typedef struct {
+    Snapshot items[HISTORY_LIMIT];
+    int count;
+    size_t bytes;
+} History;
+
+char **lines = NULL;
+size_t line_count = 0;
+size_t capacity = 0;
+
 int cy = 0, cx = 0;
-int row_offset = 0, col_offset = 0;
+int row_offset = 0;
+int col_offset = 0;
 int dirty = 0;
 
 Language language = LANG_PYTHON;
 
 char filename[512] = "untitled.py";
-char status_message[256] = "Welcome to Toben Engine v0.4 Early Access";
+char status_message[256] = "Welcome to Toben Engine";
 
-const char *python_keywords[] = {
-    "def", "class", "return", "if", "elif", "else",
-    "for", "while", "in", "import", "from", "as",
-    "try", "except", "finally", "with", "pass",
-    "break", "continue", "lambda", "yield", "raise",
-    "global", "nonlocal", "assert", "del", "async",
-    "await", "and", "or", "not", "is", "True",
-    "False", "None", "print", "self", "super", NULL
-};
+History undo_stack = {0};
+History redo_stack = {0};
 
-const char *c_keywords[] = {
-    "int", "char", "float", "double", "void",
-    "short", "long", "signed", "unsigned", "if",
-    "else", "switch", "case", "default", "for",
-    "while", "do", "break", "continue", "return",
-    "struct", "union", "enum", "typedef", "const",
-    "static", "extern", "sizeof", "volatile",
-    "register", "auto", "goto", "restrict",
-    "_Bool", NULL
-};
-
-const char *cpp_keywords[] = {
-    "alignas", "alignof", "and", "asm", "auto",
-    "bool", "break", "case", "catch", "char",
-    "class", "const", "constexpr", "consteval",
-    "constinit", "continue", "decltype", "default",
-    "delete", "do", "double", "else", "enum",
-    "explicit", "export", "extern", "false", "float",
-    "for", "friend", "goto", "if", "inline", "int",
-    "long", "mutable", "namespace", "new", "noexcept",
-    "not", "nullptr", "operator", "private",
-    "protected", "public", "register", "return",
-    "short", "signed", "sizeof", "static",
-    "static_assert", "struct", "switch", "template",
-    "this", "thread_local", "throw", "true", "try",
-    "typedef", "typeid", "typename", "union",
-    "unsigned", "using", "virtual", "void",
-    "volatile", "wchar_t", "while", "override",
-    "final", "concept", "requires", "co_await",
-    "co_return", "co_yield", NULL
-};
-
-const char *bash_keywords[] = {
-    "if", "then", "else", "elif", "fi",
-    "for", "while", "until", "do", "done",
-    "case", "esac", "in", "function", "select",
-    "time", "coproc", "return", "exit", "break",
-    "continue", "export", "local", "readonly",
-    "declare", "typeset", "unset", "shift",
-    "source", "eval", "exec", "trap", "set",
-    "echo", "printf", "read", "true", "false",
-    "test", "alias", "unalias", "jobs", "fg",
-    "bg", "wait", "kill", NULL
-};
-
-/* LANGUAGE SYSTEM */
-
-int is_c_family(void) {
-    return language == LANG_C || language == LANG_CPP;
-}
+/* LANGUAGE */
 
 void detect_language(void) {
     const char *ext = strrchr(filename, '.');
 
     if (!ext) {
         language = LANG_PYTHON;
-        return;
-    }
-
-    if (!strcmp(ext, ".cpp") ||
-        !strcmp(ext, ".cc") ||
-        !strcmp(ext, ".cxx") ||
-        !strcmp(ext, ".hpp") ||
-        !strcmp(ext, ".hh") ||
-        !strcmp(ext, ".hxx")) {
-
-        language = LANG_CPP;
-
-    } else if (!strcmp(ext, ".c") ||
-               !strcmp(ext, ".h")) {
-
+    } else if (!strcmp(ext, ".c") || !strcmp(ext, ".h")) {
         language = LANG_C;
-
+    } else if (!strcmp(ext, ".cpp") ||
+               !strcmp(ext, ".cc") ||
+               !strcmp(ext, ".cxx") ||
+               !strcmp(ext, ".hpp")) {
+        language = LANG_CPP;
     } else if (!strcmp(ext, ".sh") ||
                !strcmp(ext, ".bash")) {
-
         language = LANG_BASH;
-
+    } else if (!strcmp(ext, ".rs")) {
+        language = LANG_RUST;
     } else {
         language = LANG_PYTHON;
     }
@@ -129,46 +84,285 @@ const char *language_name(void) {
         case LANG_C: return "C";
         case LANG_CPP: return "C++";
         case LANG_BASH: return "BASH";
+        case LANG_RUST: return "RUST";
         default: return "PYTHON";
     }
 }
 
+int is_c_family(void) {
+    return language == LANG_C || language == LANG_CPP;
+}
+
 int is_keyword(const char *word) {
-    const char **list;
+    const char *keywords =
+        " int char float double void short long unsigned signed "
+        " if else switch case default for while do break continue "
+        " return struct union enum typedef const static extern "
+        " sizeof volatile auto class public private protected "
+        " namespace using template typename virtual new delete "
+        " bool true false nullptr try catch throw "
+        " def lambda yield import from as pass global nonlocal "
+        " async await and or not is None self "
+        " then elif fi done until function export local readonly "
+        " fn let mut pub impl trait match mod use crate self "
+        " i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize "
+        " f32 f64 String Vec Option Result ";
 
-    switch (language) {
-        case LANG_C:
-            list = c_keywords;
-            break;
-        case LANG_CPP:
-            list = cpp_keywords;
-            break;
-        case LANG_BASH:
-            list = bash_keywords;
-            break;
-        default:
-            list = python_keywords;
-            break;
+    char pattern[160];
+
+    if (strlen(word) + 3 >= sizeof(pattern))
+        return 0;
+
+    snprintf(pattern, sizeof(pattern), " %s ", word);
+
+    return strstr(keywords, pattern) != NULL;
+}
+
+/* MEMORY */
+
+int reserve_lines(size_t needed) {
+    if (needed <= capacity)
+        return 1;
+
+    size_t new_capacity = capacity ? capacity : 16;
+
+    while (new_capacity < needed) {
+        if (new_capacity > SIZE_MAX / 2)
+            return 0;
+
+        new_capacity *= 2;
     }
 
-    for (int i = 0; list[i]; i++) {
-        if (!strcmp(word, list[i]))
-            return 1;
+    if (new_capacity > SIZE_MAX / sizeof(char *))
+        return 0;
+
+    char **temp = realloc(
+        lines,
+        new_capacity * sizeof(char *)
+    );
+
+    if (!temp)
+        return 0;
+
+    lines = temp;
+    capacity = new_capacity;
+
+    return 1;
+}
+
+void init_document(void) {
+    if (!reserve_lines(1)) {
+        fprintf(stderr, "Toben: memory allocation failed\n");
+        exit(1);
     }
 
-    return 0;
+    lines[0] = strdup("");
+
+    if (!lines[0]) {
+        fprintf(stderr, "Toben: memory allocation failed\n");
+        exit(1);
+    }
+
+    line_count = 1;
+}
+
+void free_document(void) {
+    for (size_t i = 0; i < line_count; i++)
+        free(lines[i]);
+
+    free(lines);
+
+    lines = NULL;
+    line_count = 0;
+    capacity = 0;
+}
+
+/* HISTORY */
+
+void free_snapshot(Snapshot *s) {
+    if (!s->lines)
+        return;
+
+    for (size_t i = 0; i < s->count; i++)
+        free(s->lines[i]);
+
+    free(s->lines);
+    memset(s, 0, sizeof(*s));
+}
+
+void clear_history(History *h) {
+    for (int i = 0; i < h->count; i++)
+        free_snapshot(&h->items[i]);
+
+    h->count = 0;
+    h->bytes = 0;
+}
+
+int create_snapshot(Snapshot *s) {
+    memset(s, 0, sizeof(*s));
+
+    if (line_count > SIZE_MAX / sizeof(char *))
+        return 0;
+
+    s->lines = calloc(line_count, sizeof(char *));
+
+    if (!s->lines)
+        return 0;
+
+    s->count = line_count;
+    s->cy = cy;
+    s->cx = cx;
+    s->dirty = dirty;
+    s->bytes = line_count * sizeof(char *);
+
+    if (s->bytes > HISTORY_MEMORY) {
+        free_snapshot(s);
+        return 0;
+    }
+
+    for (size_t i = 0; i < line_count; i++) {
+        size_t len = strlen(lines[i]) + 1;
+
+        if (len > HISTORY_MEMORY - s->bytes) {
+            free_snapshot(s);
+            return 0;
+        }
+
+        s->lines[i] = strdup(lines[i]);
+
+        if (!s->lines[i]) {
+            free_snapshot(s);
+            return 0;
+        }
+
+        s->bytes += len;
+    }
+
+    return 1;
+}
+
+void drop_oldest(History *h) {
+    if (!h->count)
+        return;
+
+    h->bytes -= h->items[0].bytes;
+    free_snapshot(&h->items[0]);
+
+    for (int i = 0; i < h->count - 1; i++)
+        h->items[i] = h->items[i + 1];
+
+    h->count--;
+
+    memset(&h->items[h->count], 0, sizeof(Snapshot));
+}
+
+int push_snapshot(History *h) {
+    Snapshot s;
+
+    if (!create_snapshot(&s))
+        return 0;
+
+    while (h->count > 0 &&
+           (h->count >= HISTORY_LIMIT ||
+            h->bytes > HISTORY_MEMORY - s.bytes)) {
+        drop_oldest(h);
+    }
+
+    h->items[h->count++] = s;
+    h->bytes += s.bytes;
+
+    return 1;
+}
+
+void record_undo(void) {
+    if (!push_snapshot(&undo_stack)) {
+        snprintf(status_message, sizeof(status_message),
+                 "Undo history memory limit reached");
+    }
+
+    clear_history(&redo_stack);
+}
+
+void restore_snapshot(Snapshot *s) {
+    free_document();
+
+    lines = s->lines;
+    line_count = s->count;
+    capacity = line_count;
+
+    s->lines = NULL;
+
+    cy = s->cy;
+    cx = s->cx;
+    dirty = s->dirty;
+
+    memset(s, 0, sizeof(*s));
+
+    if (cy < 0)
+        cy = 0;
+
+    if ((size_t)cy >= line_count)
+        cy = (int)line_count - 1;
+
+    size_t len = strlen(lines[cy]);
+
+    if (cx < 0)
+        cx = 0;
+
+    if ((size_t)cx > len)
+        cx = (int)len;
+
+    row_offset = 0;
+    col_offset = 0;
+}
+
+void undo(void) {
+    if (!undo_stack.count) {
+        snprintf(status_message, sizeof(status_message),
+                 "Nothing to undo");
+        return;
+    }
+
+    if (!push_snapshot(&redo_stack)) {
+        snprintf(status_message, sizeof(status_message),
+                 "Cannot create redo snapshot");
+        return;
+    }
+
+    Snapshot *s = &undo_stack.items[undo_stack.count - 1];
+
+    undo_stack.bytes -= s->bytes;
+    undo_stack.count--;
+
+    restore_snapshot(s);
+
+    snprintf(status_message, sizeof(status_message), "Undo");
+}
+
+void redo(void) {
+    if (!redo_stack.count) {
+        snprintf(status_message, sizeof(status_message),
+                 "Nothing to redo");
+        return;
+    }
+
+    if (!push_snapshot(&undo_stack)) {
+        snprintf(status_message, sizeof(status_message),
+                 "Cannot create undo snapshot");
+        return;
+    }
+
+    Snapshot *s = &redo_stack.items[redo_stack.count - 1];
+
+    redo_stack.bytes -= s->bytes;
+    redo_stack.count--;
+
+    restore_snapshot(s);
+
+    snprintf(status_message, sizeof(status_message), "Redo");
 }
 
 /* FILE MANAGEMENT */
-
-void init_lines(void) {
-    lines[0] = calloc(MAX_LINE, 1);
-
-    if (!lines[0]) {
-        fprintf(stderr, "Toben: Memory allocation failed\n");
-        exit(1);
-    }
-}
 
 void load_file(void) {
     FILE *f = fopen(filename, "r");
@@ -176,31 +370,55 @@ void load_file(void) {
     if (!f)
         return;
 
-    free(lines[0]);
-    line_count = 0;
+    free_document();
 
-    char buffer[MAX_LINE];
+    char *buffer = NULL;
+    size_t buffer_size = 0;
+    ssize_t length;
 
-    while (fgets(buffer, sizeof(buffer), f) &&
-           line_count < MAX_LINES) {
+    int failed = 0;
 
-        buffer[strcspn(buffer, "\r\n")] = '\0';
+    while ((length = getline(&buffer, &buffer_size, f)) != -1) {
+        if (length > 0 && buffer[length - 1] == '\n')
+            buffer[--length] = '\0';
 
-        lines[line_count] = calloc(MAX_LINE, 1);
+        if (length > 0 && buffer[length - 1] == '\r')
+            buffer[--length] = '\0';
 
-        if (!lines[line_count])
+        if (!reserve_lines(line_count + 1)) {
+            failed = 1;
             break;
+        }
 
-        strncpy(lines[line_count], buffer, MAX_LINE - 1);
+        lines[line_count] = strdup(buffer);
+
+        if (!lines[line_count]) {
+            failed = 1;
+            break;
+        }
+
         line_count++;
     }
+
+    free(buffer);
+
+    if (ferror(f))
+        failed = 1;
 
     fclose(f);
 
     if (line_count == 0)
-        init_lines();
+        init_document();
 
     dirty = 0;
+
+    clear_history(&undo_stack);
+    clear_history(&redo_stack);
+
+    if (failed) {
+        snprintf(status_message, sizeof(status_message),
+                 "Warning: file loaded partially");
+    }
 }
 
 void save_file(void) {
@@ -212,12 +430,21 @@ void save_file(void) {
         return;
     }
 
-    for (int i = 0; i < line_count; i++)
-        fprintf(f, "%s\n", lines[i]);
+    int failed = 0;
 
-    if (fclose(f) != 0) {
+    for (size_t i = 0; i < line_count; i++) {
+        if (fprintf(f, "%s\n", lines[i]) < 0) {
+            failed = 1;
+            break;
+        }
+    }
+
+    if (fclose(f) != 0)
+        failed = 1;
+
+    if (failed) {
         snprintf(status_message, sizeof(status_message),
-                 "ERROR: Failed to finish saving");
+                 "ERROR: Save failed");
         return;
     }
 
@@ -230,6 +457,9 @@ void save_file(void) {
 /* COLORS */
 
 void init_colors(void) {
+    if (!has_colors())
+        return;
+
     start_color();
     use_default_colors();
 
@@ -239,73 +469,18 @@ void init_colors(void) {
     init_pair(4, COLOR_RED, -1);
     init_pair(5, COLOR_CYAN, -1);
     init_pair(6, COLOR_MAGENTA, -1);
-    init_pair(7, COLOR_BLUE, -1);
 }
 
 /* SYNTAX HIGHLIGHTING */
 
-void draw_line(int row, int index, int *block_comment) {
+void draw_line(int row, size_t index) {
     const char *s = lines[index] + col_offset;
     int col = 0;
 
-    const char *original = lines[index];
-    int first = 0;
-
-    while (original[first] == ' ' ||
-           original[first] == '\t')
-        first++;
-
-    if (is_c_family() && original[first] == '#') {
-        attron(COLOR_PAIR(6));
-        mvaddnstr(row, 5, s, COLS - 5);
-        attroff(COLOR_PAIR(6));
-        return;
-    }
-
     while (*s && col < COLS - 5) {
-
-        if (is_c_family() && *block_comment) {
-            attron(COLOR_PAIR(4));
-
-            if (s[0] == '*' && s[1] == '/') {
-                mvaddch(row, col + 5, *s++);
-                col++;
-
-                if (*s) {
-                    mvaddch(row, col + 5, *s++);
-                    col++;
-                }
-
-                *block_comment = 0;
-            } else {
-                mvaddch(row, col + 5, *s++);
-                col++;
-            }
-
-            attroff(COLOR_PAIR(4));
-            continue;
-        }
-
-        if (is_c_family() &&
-            s[0] == '/' && s[1] == '*') {
-
-            attron(COLOR_PAIR(4));
-
-            mvaddch(row, col + 5, *s++);
-            col++;
-
-            mvaddch(row, col + 5, *s++);
-            col++;
-
-            attroff(COLOR_PAIR(4));
-
-            *block_comment = 1;
-            continue;
-        }
-
         if (((language == LANG_PYTHON ||
               language == LANG_BASH) && *s == '#') ||
-            (is_c_family() &&
+            ((is_c_family() || language == LANG_RUST) &&
              s[0] == '/' && s[1] == '/')) {
 
             attron(COLOR_PAIR(4));
@@ -319,7 +494,31 @@ void draw_line(int row, int index, int *block_comment) {
             break;
         }
 
-        if (*s == '\'' || *s == '"') {
+        if (is_c_family() &&
+            s[0] == '/' && s[1] == '*') {
+
+            attron(COLOR_PAIR(4));
+
+            while (*s && col < COLS - 5) {
+                mvaddch(row, col + 5, *s);
+
+                if (s[0] == '*' && s[1] == '/') {
+                    col++;
+                    mvaddch(row, col + 5, s[1]);
+                    s += 2;
+                    col++;
+                    break;
+                }
+
+                s++;
+                col++;
+            }
+
+            attroff(COLOR_PAIR(4));
+            continue;
+        }
+
+        if (*s == '"' || *s == '\'') {
             char quote = *s;
 
             attron(COLOR_PAIR(3));
@@ -351,7 +550,6 @@ void draw_line(int row, int index, int *block_comment) {
             while ((isalnum((unsigned char)*s) ||
                     *s == '.' || *s == '_') &&
                    col < COLS - 5) {
-
                 mvaddch(row, col + 5, *s++);
                 col++;
             }
@@ -390,61 +588,38 @@ void draw_line(int row, int index, int *block_comment) {
     }
 }
 
-/* EDITOR DISPLAY */
+/* DISPLAY */
 
 void draw(void) {
     erase();
 
     int height = LINES - 3;
-    int block_comment = 0;
-
-    for (int i = 0; i < row_offset; i++) {
-        if (is_c_family()) {
-            const char *p = lines[i];
-
-            while (*p) {
-                if (!block_comment &&
-                    p[0] == '/' && p[1] == '*') {
-                    block_comment = 1;
-                    p += 2;
-                } else if (block_comment &&
-                           p[0] == '*' && p[1] == '/') {
-                    block_comment = 0;
-                    p += 2;
-                } else {
-                    p++;
-                }
-            }
-        }
-    }
 
     for (int i = 0; i < height; i++) {
-        int index = row_offset + i;
+        size_t index = (size_t)row_offset + (size_t)i;
 
         if (index >= line_count)
             break;
 
         attron(COLOR_PAIR(5));
-        mvprintw(i, 0, "%4d ", index + 1);
+        mvprintw(i, 0, "%4zu ", index + 1);
         attroff(COLOR_PAIR(5));
 
-        draw_line(i, index, &block_comment);
+        draw_line(i, index);
     }
 
     attron(COLOR_PAIR(1));
 
     mvprintw(LINES - 3, 0,
              " TOBEN ENGINE v%s | %s | %s | %s ",
-             VERSION,
-             language_name(),
-             filename,
+             VERSION, language_name(), filename,
              dirty ? "MODIFIED" : "SAVED");
 
     clrtoeol();
     attroff(COLOR_PAIR(1));
 
     mvprintw(LINES - 2, 0,
-             " CTRL+S Save | CTRL+R Build & Run | CTRL+X Exit ");
+             " CTRL+S Save | CTRL+R Run | CTRL+G Go to Line | CTRL+Z Undo | CTRL+Y Redo | CTRL+X Exit ");
 
     mvprintw(LINES - 1, 0, " %s ", status_message);
     clrtoeol();
@@ -453,109 +628,225 @@ void draw(void) {
     int screen_x = cx - col_offset + 5;
 
     if (screen_y >= 0 && screen_y < height &&
-        screen_x >= 5 && screen_x < COLS)
+        screen_x >= 5 && screen_x < COLS) {
         move(screen_y, screen_x);
+    }
 
     refresh();
 }
 
-/* TEXT EDITING */
+/* EDITING */
 
-void insert_char(int c) {
-    int len = strlen(lines[cy]);
+void insert_text(const char *text) {
+    size_t amount = strlen(text);
+    size_t len = strlen(lines[cy]);
 
-    if (len >= MAX_LINE - 2 || cx > len)
+    if (!amount || (size_t)cx > len)
         return;
 
-    memmove(lines[cy] + cx + 1,
-            lines[cy] + cx,
-            len - cx + 1);
+    if (amount > (size_t)INT_MAX - (size_t)cx)
+        return;
 
-    lines[cy][cx++] = c;
+    if (len > SIZE_MAX - amount - 1)
+        return;
+
+    char *new_line = malloc(len + amount + 1);
+
+    if (!new_line)
+        return;
+
+    memcpy(new_line, lines[cy], (size_t)cx);
+    memcpy(new_line + cx, text, amount);
+
+    memcpy(new_line + cx + amount,
+           lines[cy] + cx,
+           len - (size_t)cx + 1);
+
+    record_undo();
+
+    free(lines[cy]);
+    lines[cy] = new_line;
+
+    cx += (int)amount;
     dirty = 1;
 }
 
+void insert_char(int c) {
+    char text[2] = {(char)c, '\0'};
+    insert_text(text);
+}
+
 void new_line(void) {
-    if (line_count >= MAX_LINES)
+    size_t len = strlen(lines[cy]);
+
+    if ((size_t)cx > len)
         return;
 
-    char *new_line_buffer = calloc(MAX_LINE, 1);
+    char *left = malloc((size_t)cx + 1);
+    char *right = strdup(lines[cy] + cx);
 
-    if (!new_line_buffer)
+    if (!left || !right) {
+        free(left);
+        free(right);
         return;
+    }
 
-    for (int i = line_count; i > cy + 1; i--)
-        lines[i] = lines[i - 1];
+    memcpy(left, lines[cy], (size_t)cx);
+    left[cx] = '\0';
 
-    strcpy(new_line_buffer, lines[cy] + cx);
+    if (!reserve_lines(line_count + 1)) {
+        free(left);
+        free(right);
+        return;
+    }
 
-    lines[cy + 1] = new_line_buffer;
-    lines[cy][cx] = '\0';
+    record_undo();
 
+    free(lines[cy]);
+    lines[cy] = left;
+
+    memmove(&lines[cy + 2],
+            &lines[cy + 1],
+            (line_count - (size_t)cy - 1) * sizeof(char *));
+
+    lines[cy + 1] = right;
+
+    line_count++;
     cy++;
     cx = 0;
-    line_count++;
     dirty = 1;
 }
 
 void backspace(void) {
     if (cx > 0) {
-        int len = strlen(lines[cy]);
+        size_t len = strlen(lines[cy]);
+
+        record_undo();
 
         memmove(lines[cy] + cx - 1,
                 lines[cy] + cx,
-                len - cx + 1);
+                len - (size_t)cx + 1);
 
         cx--;
         dirty = 1;
 
     } else if (cy > 0) {
-        int previous_len = strlen(lines[cy - 1]);
-        int current_len = strlen(lines[cy]);
+        size_t previous_len = strlen(lines[cy - 1]);
+        size_t current_len = strlen(lines[cy]);
 
-        if (previous_len + current_len < MAX_LINE - 1) {
-            strcat(lines[cy - 1], lines[cy]);
+        if (previous_len > SIZE_MAX - current_len - 1)
+            return;
 
-            free(lines[cy]);
+        char *merged = malloc(previous_len + current_len + 1);
 
-            for (int i = cy; i < line_count - 1; i++)
-                lines[i] = lines[i + 1];
+        if (!merged)
+            return;
 
-            line_count--;
-            cy--;
-            cx = previous_len;
-            dirty = 1;
-        }
+        memcpy(merged, lines[cy - 1], previous_len);
+        memcpy(merged + previous_len,
+               lines[cy], current_len + 1);
+
+        record_undo();
+
+        free(lines[cy - 1]);
+        free(lines[cy]);
+
+        lines[cy - 1] = merged;
+
+        memmove(&lines[cy],
+                &lines[cy + 1],
+                (line_count - (size_t)cy - 1) * sizeof(char *));
+
+        line_count--;
+        cy--;
+        cx = (int)previous_len;
+        dirty = 1;
     }
 }
 
 void delete_char(void) {
-    int len = strlen(lines[cy]);
+    size_t len = strlen(lines[cy]);
 
-    if (cx < len) {
+    if ((size_t)cx < len) {
+        record_undo();
+
         memmove(lines[cy] + cx,
                 lines[cy] + cx + 1,
-                len - cx);
+                len - (size_t)cx);
 
         dirty = 1;
 
-    } else if (cy < line_count - 1 &&
-               len + strlen(lines[cy + 1]) < MAX_LINE - 1) {
+    } else if ((size_t)cy + 1 < line_count) {
+        size_t next_len = strlen(lines[cy + 1]);
 
-        strcat(lines[cy], lines[cy + 1]);
+        if (len > SIZE_MAX - next_len - 1)
+            return;
+
+        char *merged = malloc(len + next_len + 1);
+
+        if (!merged)
+            return;
+
+        memcpy(merged, lines[cy], len);
+        memcpy(merged + len, lines[cy + 1], next_len + 1);
+
+        record_undo();
+
+        free(lines[cy]);
         free(lines[cy + 1]);
 
-        for (int i = cy + 1; i < line_count - 1; i++)
-            lines[i] = lines[i + 1];
+        lines[cy] = merged;
+
+        memmove(&lines[cy + 1],
+                &lines[cy + 2],
+                (line_count - (size_t)cy - 2) * sizeof(char *));
 
         line_count--;
         dirty = 1;
     }
 }
 
-/* BUILD AND RUN SYSTEM */
+/* GO TO LINE */
 
-void run_process(char *program, char **args) {
+void go_to_line(void) {
+    char input[32];
+
+    echo();
+
+    mvprintw(LINES - 1, 0, " Go to line: ");
+    clrtoeol();
+    refresh();
+
+    int result = getnstr(input, sizeof(input) - 1);
+
+    noecho();
+
+    if (result == ERR || !input[0]) {
+        snprintf(status_message, sizeof(status_message),
+                 "Go to line cancelled");
+        return;
+    }
+
+    char *end;
+    long target = strtol(input, &end, 10);
+
+    if (*end || target < 1 ||
+        (unsigned long)target > line_count) {
+        snprintf(status_message, sizeof(status_message),
+                 "Invalid line number");
+        return;
+    }
+
+    cy = (int)(target - 1);
+    cx = 0;
+
+    snprintf(status_message, sizeof(status_message),
+             "Moved to line %ld", target);
+}
+
+/* PROCESS EXECUTION */
+
+int run_process(char *program, char **args) {
     pid_t pid = fork();
 
     if (pid == 0) {
@@ -566,14 +857,24 @@ void run_process(char *program, char **args) {
 
     if (pid < 0) {
         perror("Toben: fork failed");
-        return;
+        return -1;
     }
 
     int status;
 
     if (waitpid(pid, &status, 0) < 0)
-        perror("Toben: waitpid failed");
+        return -1;
+
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+
+    return -1;
 }
+
+/* BUILD AND RUN */
 
 void build_and_run(void) {
     if (dirty)
@@ -587,120 +888,100 @@ void build_and_run(void) {
 
     endwin();
 
-    printf("\n");
-    printf("====================================\n");
-    printf("       TOBEN ENGINE v%s\n", VERSION);
-    printf("       EARLY ACCESS BUILD\n");
-    printf("====================================\n");
-    printf("Language: %s\n", language_name());
-    printf("File: %s\n\n", filename);
+    int result = -1;
 
-    if (language == LANG_PYTHON ||
-        language == LANG_BASH) {
+    if (language == LANG_PYTHON) {
+        char *args[] = {"python3", filename, NULL};
+        result = run_process("python3", args);
 
-        const char *interpreter =
-            language == LANG_BASH ? "bash" : "python3";
+    } else if (language == LANG_BASH) {
+        char *args[] = {"bash", filename, NULL};
+        result = run_process("bash", args);
 
+    } else if (language == LANG_C) {
         char *args[] = {
-            (char *)interpreter,
-            filename,
-            NULL
+            "clang", "-std=c11", filename,
+            "-o", "/tmp/toben_program", NULL
         };
 
-        printf("[TOBEN] Running %s...\n\n",
-               language_name());
+        result = run_process("clang", args);
 
-        run_process((char *)interpreter, args);
-
-    } else {
-        const char *compiler =
-            language == LANG_CPP ? "clang++" : "clang";
-
-        char *output = "/tmp/toben_program";
-
-        char *compile_args[] = {
-            (char *)compiler,
-            "-Wall",
-            "-Wextra",
-            language == LANG_CPP ? "-std=c++17" : "-std=c11",
-            filename,
-            "-o",
-            output,
-            NULL
-        };
-
-        printf("[TOBEN] Compiling with %s...\n\n", compiler);
-
-        pid_t pid = fork();
-
-        if (pid == 0) {
-            execvp(compiler, compile_args);
-            perror("Compiler execution failed");
-            _exit(127);
+        if (result == 0) {
+            char *run_args[] = {"/tmp/toben_program", NULL};
+            result = run_process("/tmp/toben_program", run_args);
         }
 
-        if (pid < 0) {
-            perror("Toben: fork failed");
-        } else {
-            int status;
+    } else if (language == LANG_CPP) {
+        char *args[] = {
+            "clang++", "-std=c++17", filename,
+            "-o", "/tmp/toben_program", NULL
+        };
 
-            if (waitpid(pid, &status, 0) < 0) {
-                perror("Toben: waitpid failed");
-            } else if (WIFEXITED(status) &&
-                       WEXITSTATUS(status) == 0) {
+        result = run_process("clang++", args);
 
-                printf("\n[TOBEN] Build successful!\n");
-                printf("[TOBEN] Running program...\n\n");
+        if (result == 0) {
+            char *run_args[] = {"/tmp/toben_program", NULL};
+            result = run_process("/tmp/toben_program", run_args);
+        }
 
-                char *run_args[] = {
-                    output,
-                    NULL
-                };
+    } else if (language == LANG_RUST) {
+        char *args[] = {
+            "rustc", filename,
+            "-o", "/tmp/toben_program", NULL
+        };
 
-                run_process(output, run_args);
+        result = run_process("rustc", args);
 
-            } else {
-                printf("\n[TOBEN] Build failed.\n");
-            }
+        if (result == 0) {
+            char *run_args[] = {"/tmp/toben_program", NULL};
+            result = run_process("/tmp/toben_program", run_args);
         }
     }
 
-    printf("\n\n[TOBEN] Execution finished.");
-    printf("\nPress ENTER to return to editor...");
+    printf("\nToben: process finished with code %d\n", result);
+    printf("Press Enter to return to Toben...");
+    fflush(stdout);
 
-    int input;
-    while ((input = getchar()) != '\n' && input != EOF) {
-    }
+    int ch;
+    while ((ch = getchar()) != '\n' && ch != EOF)
+        ;
 
-    initscr();
-    raw();
-    noecho();
-    keypad(stdscr, TRUE);
+    reset_prog_mode();
+        refresh();
+    clear();
     init_colors();
-
-    snprintf(status_message, sizeof(status_message),
-             "Execution finished");
 }
 
 /* MAIN */
 
 int main(int argc, char **argv) {
-    if (argc > 1)
+    if (argc > 1) {
+        if (strlen(argv[1]) >= sizeof(filename)) {
+            fprintf(stderr, "Toben: filename too long\n");
+            return 1;
+        }
+
         snprintf(filename, sizeof(filename), "%s", argv[1]);
+    }
 
     detect_language();
-
-    init_lines();
+    init_document();
     load_file();
 
     initscr();
     raw();
     noecho();
     keypad(stdscr, TRUE);
+    curs_set(1);
+
     init_colors();
 
-    while (1) {
+    int running = 1;
+    while (running) {
         int height = LINES - 3;
+
+        if (height < 1)
+            height = 1;
 
         if (cy < row_offset)
             row_offset = cy;
@@ -711,82 +992,135 @@ int main(int argc, char **argv) {
         if (cx < col_offset)
             col_offset = cx;
 
-        if (cx >= col_offset + COLS - 5)
-            col_offset = cx - COLS + 6;
+        if (cx >= col_offset + COLS - 6)
+            col_offset = cx - COLS + 7;
 
         draw();
 
-        int ch = getch();
+        int key = getch();
 
-        if (ch == 19) {
-            save_file();
+        switch (key) {
+            case 19: /* CTRL+S */
+                save_file();
+                break;
 
-        } else if (ch == 24) {
-            break;
+            case 18: /* CTRL+R */
+                build_and_run();
+                break;
 
-        } else if (ch == 18) {
-            build_and_run();
+            case 7: /* CTRL+G */
+                go_to_line();
+                break;
 
-        } else if (ch == KEY_UP && cy > 0) {
-            cy--;
+            case 26: /* CTRL+Z */
+                undo();
+                break;
 
-            if ((size_t)cx > strlen(lines[cy]))
-                cx = strlen(lines[cy]);
+            case 25: /* CTRL+Y */
+                redo();
+                break;
 
-        } else if (ch == KEY_DOWN && cy < line_count - 1) {
-            cy++;
+            case 24: /* CTRL+X */
+                running = 0;
+                break;
 
-            if ((size_t)cx > strlen(lines[cy]))
-                cx = strlen(lines[cy]);
+            case KEY_UP:
+                if (cy > 0) {
+                    cy--;
+                    size_t len = strlen(lines[cy]);
+                    if ((size_t)cx > len)
+                        cx = (int)len;
+                }
+                break;
 
-        } else if (ch == KEY_LEFT) {
-            if (cx > 0) {
-                cx--;
-            } else if (cy > 0) {
-                cy--;
-                cx = strlen(lines[cy]);
-            }
+            case KEY_DOWN:
+                if ((size_t)cy + 1 < line_count) {
+                    cy++;
+                    size_t len = strlen(lines[cy]);
+                    if ((size_t)cx > len)
+                        cx = (int)len;
+                }
+                break;
 
-        } else if (ch == KEY_RIGHT) {
-            if ((size_t)cx < strlen(lines[cy])) {
-                cx++;
-            } else if (cy < line_count - 1) {
-                cy++;
+            case KEY_LEFT:
+                if (cx > 0) {
+                    cx--;
+                } else if (cy > 0) {
+                    cy--;
+                    cx = (int)strlen(lines[cy]);
+                }
+                break;
+
+            case KEY_RIGHT:
+                if ((size_t)cx < strlen(lines[cy])) {
+                    cx++;
+                } else if ((size_t)cy + 1 < line_count) {
+                    cy++;
+                    cx = 0;
+                }
+                break;
+
+            case KEY_HOME:
                 cx = 0;
-            }
+                break;
 
-        } else if (ch == KEY_HOME) {
-            cx = 0;
+            case KEY_END:
+                cx = (int)strlen(lines[cy]);
+                break;
 
-        } else if (ch == KEY_END) {
-            cx = strlen(lines[cy]);
+            case KEY_PPAGE:
+                cy -= height;
+                if (cy < 0)
+                    cy = 0;
+                break;
 
-        } else if (ch == KEY_BACKSPACE ||
-                   ch == 127 || ch == 8) {
-            backspace();
+            case KEY_NPAGE:
+                cy += height;
+                if ((size_t)cy >= line_count)
+                    cy = (int)line_count - 1;
+                break;
 
-        } else if (ch == KEY_DC) {
-            delete_char();
+            case KEY_BACKSPACE:
+            case 127:
+            case 8:
+                backspace();
+                break;
 
-        } else if (ch == '\n' || ch == KEY_ENTER) {
-            new_line();
+            case KEY_DC:
+                delete_char();
+                break;
 
-        } else if (ch == '\t') {
-            for (int i = 0; i < 4; i++)
-                insert_char(' ');
+            case '\n':
+            case KEY_ENTER:
+                new_line();
+                break;
 
-        } else if (ch >= 32 && ch <= 126) {
-            insert_char(ch);
+            case '\t':
+                insert_text("    ");
+                break;
+
+            default:
+                if (key >= 32 && key <= 126)
+                    insert_char(key);
+                break;
         }
     }
 
     endwin();
 
-    if (dirty)
-        fprintf(stderr, "Toben: Warning: unsaved changes lost.\n");
+    if (dirty) {
+        printf("Toben: unsaved changes. Save before exit? (y/n): ");
+        fflush(stdout);
 
-    for (int i = 0; i < line_count; i++)
-        free(lines[i]);
+        int answer = getchar();
+
+        if (answer == 'y' || answer == 'Y')
+            save_file();
+    }
+
+    clear_history(&undo_stack);
+    clear_history(&redo_stack);
+    free_document();
 
     return 0;
 }
